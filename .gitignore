@@ -1,0 +1,8 @@
+# build output
+/djgo
+/djgo.new
+*.exe
+
+# local test artifacts
+/test/out/
+*.log
