@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -124,4 +125,69 @@ func TestHandleBotCommandFindLive(t *testing.T) {
 		t.Fatalf("first button data %v, want q:%s", got, hits[0].id)
 	}
 	t.Logf("verified %d hits, first: %s / %s", len(hits), hits[0].id, hits[0].title)
+}
+
+// The single hardest requirement: bare chat text must NEVER reach yt-dlp or the
+// daemon. If this regresses, a stray sentence becomes a queued song.
+func TestBareTextNeverResolvesToSong(t *testing.T) {
+	for _, in := range []string{
+		"play something by kodak black",
+		"kodak black no flockin",
+		"https://www.youtube.com/watch?v=UE_-obgiWm0",
+		"skip it please",
+		"",
+		"   ",
+	} {
+		out, markup := handleBotCommand(in)
+		if !strings.Contains(out, "not a command") && !strings.Contains(out, "DJ bot") {
+			t.Fatalf("input %q was not refused/hinted, got %q", in, out)
+		}
+		if markup != nil {
+			// the menu keyboard is fine, but no result payload may be produced
+			if kb, ok := markup.(map[string]any); ok {
+				if _, has := kb["inline_keyboard"]; !has {
+					t.Fatalf("input %q returned unexpected markup %#v", in, markup)
+				}
+			}
+		}
+	}
+}
+
+// Every slash command must route to a daemon verb without resolving bare text.
+func TestSlashCommandsAreDistinct(t *testing.T) {
+	for _, in := range []string{"/help", "/now", "/list", "/skip", "/pause", "/play", "/status", "/vol", "/restore"} {
+		out, _ := handleBotCommand(in)
+		if strings.Contains(out, "not a command") {
+			t.Fatalf("%q was treated as bare text: %q", in, out)
+		}
+	}
+}
+
+// loadM3U is the restore fallback; a title with a comma must survive intact.
+func TestLoadM3URoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.m3u")
+	tracks := []Track{
+		{URL: "https://a/1", Title: "Artist - Song, With A Comma"},
+		{URL: "https://a/2#frag", Title: "Title #1"},
+		{URL: "https://a/3", Title: ""},
+	}
+	if err := writeM3U(path, tracks); err != nil {
+		t.Fatalf("writeM3U: %v", err)
+	}
+	got, err := loadM3U(path)
+	if err != nil {
+		t.Fatalf("loadM3U: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 tracks, got %d: %+v", len(got), got)
+	}
+	if got[0].Title != tracks[0].Title {
+		t.Fatalf("comma title mangled: %q", got[0].Title)
+	}
+	if got[1].URL != tracks[1].URL {
+		t.Fatalf("url with # mangled: %q", got[1].URL)
+	}
+	if got[2].Title != "" {
+		t.Fatalf("placeholder title invented: %q", got[2].Title)
+	}
 }

@@ -296,7 +296,7 @@ func handleBotCommand(text string) (string, any) {
 		if len(args) == 0 {
 			return "usage: /find <words>", nil
 		}
-		return findReply(callCtl("search", args, 45*time.Second))
+		return findReply(callCtl("search", args, 55*time.Second)) // > daemon's 45s ytSearch ctx
 	case "/rm":
 		if len(args) == 0 {
 			return "usage: /rm <n>", nil
@@ -502,7 +502,9 @@ func runBot() error {
 			return
 		}
 		if !allow[fmt.Sprintf("%d", m.Chat.ID)] {
-			t.sendLong(m.Chat.ID, "not allowed", nil)
+			// stay silent: replying to strangers turns the bot into a spam
+			// oracle and burns Telegram flood budget
+			fmt.Fprintf(os.Stderr, "djbot: ignored message from unlisted chat %d\n", m.Chat.ID)
 			return
 		}
 		if strings.TrimSpace(m.Text) == "" {
@@ -550,11 +552,19 @@ func runBot() error {
 			// never depend on how long a handler takes
 			off = u.UpdateID + 1
 			writeOffset(off)
+			// take the slot HERE, not inside the goroutine: a burst of updates
+			// behind a slow /add would otherwise park an unbounded number of
+			// goroutines. Pausing the poll loop is safe — the offset is already
+			// persisted, so nothing is lost, just fetched later.
+			sem <- struct{}{}
 			go func(u tgUpdate) {
-				// the slot is taken inside the goroutine so the poll loop keeps
-				// answering: a queued tap waits for a slot, it is never lost
-				sem <- struct{}{}
 				defer func() { <-sem }()
+				defer func() {
+					// a handler panic must not take the whole bot down
+					if r := recover(); r != nil {
+						fmt.Fprintf(os.Stderr, "djbot: handler panic: %v\n", r)
+					}
+				}()
 				dispatch(u)
 			}(u)
 		}

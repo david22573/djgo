@@ -377,7 +377,9 @@ func (d *daemon) volume(args []string) (string, error) {
 		return fmt.Sprintf("volume: %d", int(math.Round(cur))), nil
 	}
 	next, perr := strconv.ParseFloat(spec, 64)
-	if perr != nil {
+	if perr != nil || math.IsNaN(next) || math.IsInf(next, 0) {
+		// ParseFloat accepts "NaN"/"Inf"; json.Marshal would then fail with an
+		// opaque encoding error, so reject non-finite input as a usage error.
 		return "", errors.New("usage: dj vol [0-100|+n|-n]")
 	}
 	if spec[0] == '+' || spec[0] == '-' {
@@ -726,8 +728,14 @@ func (d *daemon) restore() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// the snapshot can be stale (a rm that landed after the last save): clamp
+	// so mpv does not reject the position while the reply claims "#N".
+	pos := snap.Pos
+	if pos < 0 || pos >= len(snap.Tracks) {
+		pos = 0
+	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
-	_, _, _ = c.Call(ctx, "set_property", "playlist-pos", snap.Pos)
+	_, _, _ = c.Call(ctx, "set_property", "playlist-pos", pos)
 	cancel()
 
 	// resume mid-track: wait for the entry to demux, then seek to the saved offset
@@ -748,10 +756,13 @@ func (d *daemon) restore() (string, error) {
 		pcancel()
 	}
 	go d.prefetchTitles(c)
+	// persist immediately: the loadlist branch above changed mpv's queue, and
+	// a crash before the next 10s autosave tick would re-restore the old one.
+	go d.snapshotWith(c)
 	if seeked > 0 {
-		return fmt.Sprintf("restored %d tracks at #%d (%s in)%s", len(snap.Tracks), snap.Pos+1, mmss(seeked), fallback), nil
+		return fmt.Sprintf("restored %d tracks at #%d (%s in)%s", len(snap.Tracks), pos+1, mmss(seeked), fallback), nil
 	}
-	return fmt.Sprintf("restored %d tracks at #%d%s", len(snap.Tracks), snap.Pos+1, fallback), nil
+	return fmt.Sprintf("restored %d tracks at #%d%s", len(snap.Tracks), pos+1, fallback), nil
 }
 
 // snapshot persists the live mpv queue + position so a kill never loses it.
