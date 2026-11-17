@@ -203,13 +203,28 @@ func (d *daemon) prepareAdd(query string) (string, error) {
 	return url, nil
 }
 
-func (d *daemon) handle(req ctlRequest) ctlReply {
+func (d *daemon) handle(req ctlRequest) (ctlReply, func(ctlReply) ctlReply) {
+	// stop and jump each end with a bounded wait that does not need the daemon
+	// lock: quit's socket teardown (up to 5s) and mpv actually applying a new
+	// playlist-pos. Returning a continuation runs that wait outside d.mu so
+	// one slow teardown cannot stall every other verb.
+	switch req.Cmd {
+	case "stop":
+		rep, after := d.stopBegin(req.ID)
+		return rep, after
+	case "pos":
+		if len(req.Args) == 0 {
+			return ctlReply{ID: req.ID, Err: "usage: dj pos <n>"}, nil
+		}
+		rep, after := d.jumpBegin(req.ID, req.Args[0])
+		return rep, after
+	}
 	out, err := d.dispatch(req.Cmd, req.Args)
 	rep := ctlReply{ID: req.ID, Out: out}
 	if err != nil {
 		rep.Err = err.Error()
 	}
-	return rep
+	return rep, nil
 }
 
 func (d *daemon) dispatch(cmd string, args []string) (string, error) {
@@ -464,32 +479,59 @@ func (d *daemon) remove(ns string) (string, error) {
 	return fmt.Sprintf("removed #%d: %s", n, title), nil
 }
 
-func (d *daemon) jump(ns string) (string, error) {
-	c, err := d.client()
-	if err != nil {
-		return "", err
-	}
+func (d *daemon) jumpBegin(id int, ns string) (ctlReply, func(ctlReply) ctlReply) {
 	var n int
 	if _, err := fmt.Sscanf(strings.TrimSpace(ns), "%d", &n); err != nil || n < 1 {
-		return "", errors.New("usage: dj pos <n>")
+		return ctlReply{ID: id, Err: "usage: dj pos <n>"}, nil
 	}
-	pl, err := d.playlist(c)
+	c, err := d.client()
 	if err != nil {
-		return "", err
+		return ctlReply{ID: id, Err: err.Error()}, nil
+	}
+	pl, perr := d.playlist(c)
+	if perr != nil {
+		return ctlReply{ID: id, Err: perr.Error()}, nil
 	}
 	if n > len(pl) {
-		return "", fmt.Errorf("no track #%d", n)
+		return ctlReply{ID: id, Err: fmt.Sprintf("no track #%d", n)}, nil
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
-	defer cancel()
-	if _, errstr, err := c.Call(ctx, "set_property", "playlist-pos", n-1); err != nil {
-		return "", err
-	} else if errstr != "" && errstr != "success" {
-		return "", errors.New(errstr)
+	_, errstr, cerr := c.Call(ctx, "set_property", "playlist-pos", n-1)
+	cancel()
+	if cerr != nil {
+		return ctlReply{ID: id, Err: cerr.Error()}, nil
 	}
-	time.Sleep(120 * time.Millisecond)
-	d.snapshot()
-	return fmt.Sprintf("jumped to #%d", n), nil
+	if errstr != "" && errstr != "success" {
+		return ctlReply{ID: id, Err: errstr}, nil
+	}
+	return ctlReply{ID: id}, func(rep ctlReply) ctlReply {
+		// poll for mpv to actually move instead of a blind sleep, and persist
+		// the snapshot here so the wait never runs under the daemon lock
+		deadline := time.Now().Add(600 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			pctx, pcancel := ctxTimeout(time.Second)
+			cur, _ := c.PropInt(pctx, "playlist-pos")
+			pcancel()
+			if cur == n-1 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		d.snapshotWith(c)
+		rep.Out = fmt.Sprintf("jumped to #%d", n)
+		return rep
+	}
+}
+
+func (d *daemon) jump(ns string) (string, error) {
+	rep, after := d.jumpBegin(0, ns)
+	if after != nil {
+		rep = after(rep)
+	}
+	if rep.Err != "" {
+		return rep.Out, errors.New(rep.Err)
+	}
+	return rep.Out, nil
 }
 
 func (d *daemon) skip() (string, error) {
@@ -631,7 +673,7 @@ func (d *daemon) start(playlist string) (string, error) {
 	return fmt.Sprintf("mpv up (pid %d)", pid), nil
 }
 
-func (d *daemon) stop() (string, error) {
+func (d *daemon) stopBegin(id int) (ctlReply, func(ctlReply) ctlReply) {
 	if d.ipc != nil {
 		select {
 		case <-d.ipc.closed:
@@ -657,17 +699,38 @@ func (d *daemon) stop() (string, error) {
 		d.ipc = nil
 		quit = true
 	}
-	if quit {
+	sock := d.sock
+	if !quit {
+		// callers below finish the reply; the socket wait is still skipped when
+		// there was nothing to quit, matching the old fast path
+		return ctlReply{ID: id, Out: "mpv stopped"}, nil
+	}
+	return ctlReply{ID: id}, func(rep ctlReply) ctlReply {
+		// this loop can take up to 5s; it must NOT hold the daemon lock
 		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) && socketAlive(d.sock) {
+		for time.Now().Before(deadline) && socketAlive(sock) {
 			time.Sleep(100 * time.Millisecond)
 		}
+		if socketAlive(sock) {
+			rep.Out = ""
+			rep.Err = "mpv still running after quit"
+			return rep
+		}
+		_ = os.Remove(sock) // nothing holds it, so this is a stale file
+		rep.Out = "mpv stopped"
+		return rep
 	}
-	if socketAlive(d.sock) {
-		return "", errors.New("mpv still running after quit")
+}
+
+func (d *daemon) stop() (string, error) {
+	rep, after := d.stopBegin(0)
+	if after != nil {
+		rep = after(rep)
 	}
-	_ = os.Remove(d.sock) // nothing holds it, so this is a stale file
-	return "mpv stopped", nil
+	if rep.Err != "" {
+		return rep.Out, errors.New(rep.Err)
+	}
+	return rep.Out, nil
 }
 
 func (d *daemon) saveQuiet(path string) error {
@@ -856,9 +919,16 @@ func (d *daemon) Run() error {
 				if early != nil {
 					rep = *early
 				} else {
+					var after func(ctlReply) ctlReply
 					d.mu.Lock()
-					rep = d.handle(req)
+					rep, after = d.handle(req)
 					d.mu.Unlock()
+					// verbs whose tail is a bounded wait (stop's socket
+					// teardown, pos letting mpv move) finish it here so the
+					// daemon lock is free while they sleep
+					if after != nil {
+						rep = after(rep)
+					}
 				}
 				if err := enc.Encode(rep); err != nil {
 					return
